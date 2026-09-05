@@ -19,11 +19,12 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from gateway import hosted_room_driver as driver
 from gateway import hosted_rooms
+from gateway.hosted_room_discussion_policy import DiscussionPolicy
 
 
 MAX_DISCUSSION_MEMBERS = 6
@@ -43,8 +44,8 @@ TerminalKind = Literal["settled", "failed", "cancelled", "deferred"]
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 _MENTION_RE = re.compile(r"@([A-Za-z0-9][A-Za-z0-9._:-]*)", re.IGNORECASE)
 _TURN_ID_RE = re.compile(
-    r"^d(?P<source>[1-9][0-9]*)\.r(?P<round>[0-2])\."
-    r"p(?P<position>[0-5])\.s(?P<seen>[1-9][0-9]*)\."
+    r"^d(?P<source>[1-9][0-9]*)\.r(?P<round>[0-9]+)\."
+    r"p(?P<position>[0-9]+)\.s(?P<seen>[1-9][0-9]*)\."
     r"m(?P<member>[0-9a-f]{24})$"
 )
 
@@ -142,6 +143,7 @@ class DiscussionRoom:
     members: tuple[DiscussionMember, ...]
     gateway_id: str
     authority_epoch: int
+    policy: DiscussionPolicy = DiscussionPolicy()
 
 
 @dataclass(frozen=True)
@@ -361,15 +363,16 @@ def validate_roster(
     value: Any,
     *,
     local_profiles: Iterable[str],
+    policy: DiscussionPolicy = DiscussionPolicy(),
 ) -> tuple[DiscussionMember, ...]:
-    """Validate a frozen 2-6 member roster of profiles on this gateway."""
+    """Validate a frozen bounded member roster of profiles on this gateway."""
 
     if not isinstance(value, list):
         raise DiscussionValidationError("members must be a list")
-    if not MIN_DISCUSSION_MEMBERS <= len(value) <= MAX_DISCUSSION_MEMBERS:
+    if not MIN_DISCUSSION_MEMBERS <= len(value) <= policy.max_members:
         raise DiscussionValidationError(
             f"members must contain between {MIN_DISCUSSION_MEMBERS} and "
-            f"{MAX_DISCUSSION_MEMBERS} entries"
+            f"{policy.max_members} entries"
         )
 
     known_profiles = {
@@ -471,11 +474,15 @@ def validate_room(
         value.get("authority_epoch"),
         label="authority_epoch",
     )
-    members = validate_roster(value.get("members"), local_profiles=local_profiles)
+    policy = DiscussionPolicy.from_dict(value.get("discussion_policy"))
+    members = validate_roster(
+        value.get("members"), local_profiles=local_profiles, policy=policy
+    )
     return DiscussionRoom(
         room_id=room_id,
         name=name,
         members=members,
+        policy=policy,
         gateway_id=gateway_id,
         authority_epoch=authority_epoch,
     )
@@ -641,12 +648,12 @@ def _validate_turn_coordinates(
     member_index = _zero_based_int(
         payload.get("member_index"),
         label="member_index",
-        maximum=MAX_DISCUSSION_MEMBERS - 1,
+        maximum=min(len(room.members), room.policy.max_turns_per_round) - 1,
     )
     round_index = _zero_based_int(
         payload.get("round_index"),
         label="round_index",
-        maximum=MAX_DISCUSSION_ROUNDS - 1,
+        maximum=room.policy.max_rounds - 1,
     )
     thread_id = _identifier(payload.get("thread_id"), label="thread_id")
     task_id = _identifier(payload.get("task_id"), label="task_id")
@@ -742,11 +749,40 @@ def _validated_events(
     *,
     room: DiscussionRoom,
 ) -> tuple[_ValidatedEvent, ...]:
+    # Replay validates historical receipts against the authority that owned
+    # their sequence, following only a complete chain ending at today's fence.
+    historical_rooms = {}
+    historical = room
+    for raw in reversed(events):
+        if not isinstance(raw, Mapping):
+            raise DiscussionValidationError("room event must be an object")
+        if raw.get("kind") == "authority.claimed":
+            claim = raw.get("payload", {})
+            if (
+                not isinstance(claim, Mapping)
+                or not isinstance(raw.get("actor"), Mapping)
+                or raw.get("actor", {}).get("kind") != "system"
+                or raw.get("actor", {}).get("id") != "authority-control"
+                or claim.get("authority_gateway_id") != historical.gateway_id
+                or claim.get("authority_epoch") != historical.authority_epoch
+                or raw.get("authority_epoch") != historical.authority_epoch
+            ):
+                raise DiscussionValidationError("invalid authority claim in replay")
+            historical = replace(
+                historical,
+                gateway_id=_identifier(
+                    claim.get("previous_gateway_id"), label="previous_gateway_id"
+                ),
+                authority_epoch=historical.authority_epoch - 1,
+            )
+        historical_rooms[id(raw)] = historical
     validated: list[_ValidatedEvent] = []
     previous_seq = 0
     event_ids: set[str] = set()
     for raw in events:
-        event = _validate_event(raw, room=room, previous_seq=previous_seq)
+        event = _validate_event(
+            raw, room=historical_rooms[id(raw)], previous_seq=previous_seq
+        )
         if event.event_id in event_ids:
             raise DiscussionValidationError("room event ids must be unique")
         validated.append(event)
@@ -889,7 +925,7 @@ def _build_prompt(
     seen_through_seq: int,
 ) -> str:
     delta = [event for event in messages if watermark < event.seq <= seen_through_seq][
-        -MAX_DISCUSSION_DELTA_LINES:
+        -room.policy.max_delta_lines :
     ]
     peers = ", ".join(
         f"@{candidate.handle}"
@@ -1087,7 +1123,7 @@ def plan_next_task(
         if event.kind == "message.member"
         and event.payload.get("discussion_event_id") == discussion.event_id
     )
-    if len(member_messages) >= MAX_DISCUSSION_MESSAGES:
+    if len(member_messages) >= room.policy.max_messages_total:
         return DiscussionDecision(
             status="bounded",
             reason="max_messages",
@@ -1111,7 +1147,7 @@ def plan_next_task(
         watermarks[key] = max(watermarks.get(key, 0), value)
     seen_through_seq = max(event.seq for event in thread_messages)
 
-    for round_index in range(MAX_DISCUSSION_ROUNDS):
+    for round_index in range(room.policy.max_rounds):
         # The user's message selects the first round, with no mention meaning
         # everyone. Later rounds are opt-in: only a peer explicitly cited by a
         # Bot and not heard from afterward gets another turn. Every member's
@@ -1123,6 +1159,29 @@ def plan_next_task(
             else _unaddressed_member_mentions(discussion_messages, room)
         )
         ordered = _rotate(responders, round_index)
+        # Reserve the entire selected round before its first execution. Passes
+        # and failures never make admission depend on a partial model result.
+        remaining = [
+            member
+            for member in ordered
+            if (round_index, member.member_id) not in terminals
+        ]
+        reason = None
+        eligible_ids = {member.member_id for member in ordered} | {
+            member_id for (index, member_id) in terminals if index == round_index
+        }
+        if len(eligible_ids) > room.policy.max_turns_per_round:
+            reason = "round_budget_too_small"
+        elif len(member_messages) + len(remaining) > room.policy.max_messages_total:
+            reason = "max_messages"
+        if reason:
+            return DiscussionDecision(
+                status="bounded",
+                reason=reason,
+                discussion_event_id=discussion.event_id,
+                source_event_seq=discussion.seq,
+                thread_id=thread_id,
+            )
         for member_index, member in enumerate(ordered):
             if (round_index, member.member_id) in terminals:
                 continue
@@ -1171,7 +1230,7 @@ def plan_next_task(
                 source_event_seq=discussion.seq,
                 thread_id=thread_id,
             )
-        if round_index == MAX_DISCUSSION_ROUNDS - 1:
+        if round_index == room.policy.max_rounds - 1:
             return DiscussionDecision(
                 status="bounded",
                 reason="max_rounds",
@@ -1218,6 +1277,16 @@ def reconstruct_task_plan(
     round_index = int(match.group("round"))
     member_index = int(match.group("position"))
     seen_through_seq = int(match.group("seen"))
+    if not (
+        0 <= round_index < room.policy.max_rounds
+        and 0 <= member_index < min(len(room.members), room.policy.max_turns_per_round)
+    ):
+        raise DiscussionReconstructionError("turn coordinates exceed frozen policy")
+    if seen_through_seq < source_event_seq or not any(
+        event.seq == seen_through_seq and event.kind in {"message.user", "message.member"}
+        for event in validated
+    ):
+        raise DiscussionReconstructionError("turn watermark is not a visible message")
     if payload.get("source_event_seq") != source_event_seq:
         raise DiscussionReconstructionError("task source event does not match turn_id")
     discussion = next(
@@ -1255,6 +1324,27 @@ def reconstruct_task_plan(
         member = None
     if member is None or _member_digest(member) != match.group("member"):
         raise DiscussionReconstructionError("task target member does not match turn_id")
+    prior_messages = tuple(
+        event
+        for event in validated
+        if source_event_seq <= event.seq <= seen_through_seq
+        and event.payload.get("thread_id") == discussion.payload["thread_id"]
+        and event.kind in {"message.user", "message.member"}
+    )
+    responders = (
+        resolve_mentions((str(discussion.payload["text"]),), room.members)
+        if round_index == 0
+        else _unaddressed_member_mentions(prior_messages, room)
+    )
+    ordered = _rotate(responders, round_index)
+    if (
+        len(ordered) > room.policy.max_turns_per_round
+        or member_index >= len(ordered)
+        or ordered[member_index] != member
+    ):
+        raise DiscussionReconstructionError(
+            "turn position does not match the ordered round"
+        )
     prompt = payload.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise DiscussionReconstructionError("task prompt is missing")

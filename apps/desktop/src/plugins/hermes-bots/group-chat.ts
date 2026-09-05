@@ -56,6 +56,7 @@ let groupChatSyncTimer: ReturnType<typeof setTimeout> | null = null
 /** One room inside the bounded ui_meta projection: a compacted log plus the
  *  identity fields, without any of `GroupChat`'s runtime/orchestration state. */
 interface GroupChatSyncRoom {
+  discussion_policy?: GroupChat['discussion_policy']
   image?: null | string
   log: GroupMessage[]
   members?: GroupMember[]
@@ -246,8 +247,9 @@ export function groupChatSyncSnapshot(
           }
         : {}),
       log,
+      ...(room.discussion_policy ? { discussion_policy: room.discussion_policy } : {}),
       revision: Math.max(0, Number(room?.syncRevision ?? room?.revision ?? 0)),
-      members: (Array.isArray(room.members) ? room.members : []).slice(0, GROUP_CHAT_MAX_MEMBERS).map(member => ({
+      members: (Array.isArray(room.members) ? room.members : []).slice(0, GROUP_CHAT_HARD_CAP_MEMBERS).map(member => ({
         name: String(member?.name || '').slice(0, 128),
         ...(member?.handle
           ? {
@@ -454,6 +456,7 @@ export function mergeGroupChatSyncSnapshots(
     }
 
     rooms[key] = {
+      ...(identity?.discussion_policy ? { discussion_policy: identity.discussion_policy } : {}),
       ...(identity?.name
         ? {
             name: identity.name
@@ -665,6 +668,7 @@ export function mergeRemoteGroupChatSnapshotIntoRooms(
 
     rooms[targetName] = {
       ...existing,
+      ...(projected.discussion_policy ? { discussion_policy: projected.discussion_policy } : {}),
       log: bounded.log,
       watermarks: bounded.watermarks,
       sessions: existing.sessions && typeof existing.sessions === 'object' ? existing.sessions : {},
@@ -1211,7 +1215,15 @@ export const GROUP_CHAT_MAX_ROUNDS = 3
 export const GROUP_CHAT_MAX_MESSAGES = 10
 export const GROUP_CHAT_MAX_CONTINUATIONS = 2
 export const GROUP_CHAT_HISTORY_LIMIT = 24
+export const GROUP_CHAT_HARD_CAP_MEMBERS = 32
 export const GROUP_CHAT_MAX_MEMBERS = 6
+
+/** Read the effective backend ceiling without changing legacy creation defaults. */
+export function groupChatMemberCap(room: Pick<GroupChat, 'discussion_policy'>): number {
+  const cap = room.discussion_policy?.max_members
+
+  return Number.isInteger(cap) && cap! >= 2 && cap! <= GROUP_CHAT_HARD_CAP_MEMBERS ? cap! : GROUP_CHAT_MAX_MEMBERS
+}
 
 /** Transcript form of a room speaker's profile name. Friendly identity wins:
  *  a Bot Mode title or a core profile display_name (e.g. default renamed to

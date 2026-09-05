@@ -982,3 +982,27 @@ describe('sync worker', () => {
     expect(configured.has('gw-b')).toBe(true)
   })
 })
+
+describe('hosted room budget projection', () => {
+  it('preserves all ten members and the frozen ceiling through sync', async () => {
+    const { chat } = await loadRoom()
+    const policy = { max_members: 10, max_rounds: 3, max_turns_per_round: 10, max_messages_total: 30, max_delta_lines: 24 }
+
+    const snapshot = chat.groupChatSyncSnapshot({
+      Hosted: {
+        roomId: 'hosted-test',
+        discussion_policy: policy,
+        log: [{ from: { kind: 'user', name: 'Tester' }, text: 'Hello', at: 1 }],
+        members: Array.from({ length: 10 }, (_, i) => ({ name: `bot-${i}` })),
+        watermarks: {}
+      }
+    })
+
+    const projected = Object.values(snapshot.rooms)[0]
+    expect(projected.members).toHaveLength(10)
+    expect(projected.discussion_policy).toEqual(policy)
+    expect(chat.groupChatMemberCap(projected)).toBe(10)
+    expect(chat.groupChatMemberCap({})).toBe(6)
+    expect(chat.groupChatMemberCap({ discussion_policy: { ...policy, max_members: 33 } })).toBe(6)
+  })
+})

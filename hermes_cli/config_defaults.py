@@ -3241,6 +3241,11 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        # Operator ceilings; room overrides may only reduce these budgets.
+        "hosted_rooms": {"discussion": {
+            "max_members": 6, "max_rounds": 3, "max_turns_per_round": 6,
+            "max_messages_total": 10, "max_delta_lines": 24,
+        }},
         # Optional named-profile allowlist for multiplex mode. None preserves
         # the historical serve-all behavior; [] serves only the default.
         "multiplex_profile_allowlist": None,

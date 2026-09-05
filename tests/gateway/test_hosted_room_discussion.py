@@ -634,7 +634,9 @@ def test_ten_message_bound(tmp_path: Path):
     )
     _append_user(db, event_id="user-1", text="Discuss.")
 
-    for index in range(discussion.MAX_DISCUSSION_MESSAGES):
+    # Six replies leave four slots; the next five-member selection must be
+    # rejected as a whole instead of silently serving only four members.
+    for index in range(6):
         _settle_next(room, db, text=f"Reply {index}. @everyone")
 
     decision = discussion.plan_next_task(

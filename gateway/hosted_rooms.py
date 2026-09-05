@@ -12,6 +12,8 @@ can isolate state. Production handlers use the gateway's root ``state.db``.
 
 from __future__ import annotations
 
+from gateway.hosted_room_discussion_policy import DiscussionPolicy
+
 import hashlib
 import json
 import re
@@ -54,6 +56,7 @@ _ROOM_SCHEMA_COLUMNS = frozenset({
     "room_id",
     "name",
     "members_json",
+    "discussion_policy_json",
     "authority_gateway_id",
     "authority_epoch",
     "next_seq",
@@ -453,6 +456,16 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             disbanded_at REAL
         )"""
     )
+    if "discussion_policy_json" not in {
+        row[1] for row in conn.execute("PRAGMA table_info(hosted_rooms)")
+    }:
+        # Only compiled defaults are used to backfill legacy rooms.
+        default_policy = DiscussionPolicy().canonical_json()
+        conn.execute(
+            "ALTER TABLE hosted_rooms ADD COLUMN discussion_policy_json TEXT NOT NULL DEFAULT '"
+            + default_policy
+            + "'"
+        )
     conn.execute(
         """CREATE TABLE IF NOT EXISTS hosted_room_events (
             room_id TEXT NOT NULL,
@@ -1222,6 +1235,9 @@ def _room_from_row(row: sqlite3.Row, *, idempotent: bool = False) -> dict[str, A
         "room_id": row["room_id"],
         "name": row["name"],
         "members": json.loads(row["members_json"]),
+        "discussion_policy": DiscussionPolicy.from_dict(
+            json.loads(row["discussion_policy_json"])
+        ).to_dict(),
         "authority_gateway_id": row["authority_gateway_id"],
         "authority_epoch": int(row["authority_epoch"]),
         "revision": int(row["revision"]),
@@ -1418,9 +1434,11 @@ def create_room(
     name: Any,
     members: Any,
     authority_gateway_id: Any,
+    discussion_policy: Any = None,
     now: float | None = None,
 ) -> dict[str, Any]:
     """Create a room, or return the identical existing room idempotently."""
+    policy_json = DiscussionPolicy.from_dict(discussion_policy).canonical_json()
     room_id = _validate_identifier(
         room_id,
         label="room_id",
@@ -1442,7 +1460,7 @@ def create_room(
         ).fetchone():
             raise RoomConflictError("room_id belongs to a disbanded room")
         existing = conn.execute(
-            """SELECT room_id, name, members_json, authority_gateway_id,
+            """SELECT room_id, name, members_json, discussion_policy_json, authority_gateway_id,
                       authority_epoch, next_seq, event_bytes, revision,
                       created_at, updated_at, disbanded_at
                FROM hosted_rooms WHERE room_id=?""",
@@ -1459,7 +1477,11 @@ def create_room(
                 legacy_adoption
                 and _legacy_members_match(existing["members_json"], normalized_members)
             )
-            if existing["name"] != name or not members_match:
+            if (
+                existing["name"] != name
+                or not members_match
+                or existing["discussion_policy_json"] != policy_json
+            ):
                 raise RoomConflictError("room_id already exists with different state")
             if legacy_adoption:
                 target_epoch = int(existing["authority_epoch"]) + 1
@@ -1527,7 +1549,7 @@ def create_room(
                 if adopted.rowcount != 1:
                     raise AuthorityConflictError("legacy room adoption lost its fence")
                 existing = conn.execute(
-                    """SELECT room_id, name, members_json, authority_gateway_id,
+                    """SELECT room_id, name, members_json, discussion_policy_json, authority_gateway_id,
                               authority_epoch, next_seq, revision, created_at,
                               updated_at, disbanded_at
                          FROM hosted_rooms WHERE room_id=?""",
@@ -1566,14 +1588,39 @@ def create_room(
 
         conn.execute(
             """INSERT INTO hosted_rooms
-               (room_id, name, members_json, authority_gateway_id,
+               (room_id, name, members_json, discussion_policy_json, authority_gateway_id,
                 authority_epoch, next_seq, event_bytes, revision,
                 created_at, updated_at, disbanded_at)
-               VALUES (?, ?, ?, ?, 1, 1, 0, 1, ?, ?, NULL)""",
-            (room_id, name, members_json, authority_gateway_id, now, now),
+               VALUES (?, ?, ?, ?, ?, 1, 1, 0, 1, ?, ?, NULL)""",
+            (room_id, name, members_json, policy_json, authority_gateway_id, now, now),
         )
+        if discussion_policy is not None:
+            actor_json = _canonical_json(
+                {"kind": "system", "id": authority_gateway_id},
+                label="actor",
+                max_bytes=4096,
+            )
+            payload_json = _canonical_json(
+                {"discussion_policy": json.loads(policy_json)},
+                label="payload",
+                max_bytes=MAX_EVENT_JSON_BYTES,
+            )
+            size = _event_storage_bytes(
+                event_id="system:room-created",
+                kind="room.created",
+                actor_json=actor_json,
+                payload_json=payload_json,
+            )
+            conn.execute(
+                "INSERT INTO hosted_room_events (room_id, seq, event_id, kind, actor_json, authority_epoch, payload_json, created_at) VALUES (?, 1, 'system:room-created', 'room.created', ?, 1, ?, ?)",
+                (room_id, actor_json, payload_json, now),
+            )
+            conn.execute(
+                "UPDATE hosted_rooms SET next_seq=2, event_bytes=? WHERE room_id=?",
+                (size, room_id),
+            )
         row = conn.execute(
-            """SELECT room_id, name, members_json, authority_gateway_id,
+            """SELECT room_id, name, members_json, discussion_policy_json, authority_gateway_id,
                       authority_epoch, revision, created_at, updated_at
                FROM hosted_rooms WHERE room_id=?""",
             (room_id,),
@@ -1604,7 +1651,7 @@ def list_rooms(
     conn = _read_connection(db_path)
     try:
         rows = conn.execute(
-            """SELECT room_id, name, members_json, authority_gateway_id,
+            """SELECT room_id, name, members_json, discussion_policy_json, authority_gateway_id,
                       authority_epoch, next_seq, revision, created_at, updated_at,
                       disbanded_at
                FROM hosted_rooms
@@ -1645,7 +1692,7 @@ def rename_room(
     )
     with _transaction(db_path, immediate=True) as conn:
         room = conn.execute(
-            """SELECT room_id, name, members_json, authority_gateway_id,
+            """SELECT room_id, name, members_json, discussion_policy_json, authority_gateway_id,
                       authority_epoch, next_seq, event_bytes, revision, created_at,
                       updated_at, disbanded_at
                  FROM hosted_rooms WHERE room_id=?""",
@@ -1693,7 +1740,7 @@ def rename_room(
             (room_id, seq, event_id, actor_json, epoch, payload_json, now),
         )
         updated = conn.execute(
-            """SELECT room_id, name, members_json, authority_gateway_id,
+            """SELECT room_id, name, members_json, discussion_policy_json, authority_gateway_id,
                       authority_epoch, next_seq, revision, created_at,
                       updated_at, disbanded_at
                  FROM hosted_rooms WHERE room_id=?""",
@@ -1971,7 +2018,7 @@ def room_state(
     )
     with _transaction(db_path) as conn:
         row = conn.execute(
-            """SELECT room_id, name, members_json, authority_gateway_id,
+            """SELECT room_id, name, members_json, discussion_policy_json, authority_gateway_id,
                       authority_epoch, next_seq, revision, created_at, updated_at,
                       disbanded_at
                  FROM hosted_rooms
@@ -2174,7 +2221,7 @@ def claim_authority(
                 (room_id, event_id),
             ).fetchone()
         state_row = conn.execute(
-            """SELECT room_id, name, members_json, authority_gateway_id,
+            """SELECT room_id, name, members_json, discussion_policy_json, authority_gateway_id,
                       authority_epoch, next_seq, revision, created_at, updated_at
                  FROM hosted_rooms WHERE room_id=?""",
             (room_id,),
@@ -2373,7 +2420,7 @@ def read_events(
 
     with _transaction(db_path) as conn:
         room = conn.execute(
-            """SELECT next_seq, authority_gateway_id, authority_epoch
+            """SELECT next_seq, discussion_policy_json, authority_gateway_id, authority_epoch
                FROM hosted_rooms
                WHERE room_id=? AND (disbanded_at IS NULL OR ?)""",
             (room_id, int(include_disbanded)),
@@ -2415,6 +2462,7 @@ def read_events(
             "cursor": cursor,
             "latest_seq": latest_seq,
             "has_more": cursor < latest_seq,
+            "discussion_policy": json.loads(room["discussion_policy_json"]),
             "authority": {
                 "gateway_id": authority_gateway,
                 "epoch": authority_epoch,

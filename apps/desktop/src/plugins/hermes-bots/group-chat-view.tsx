@@ -63,6 +63,7 @@ import {
   $groupChatWorkspace,
   $groupClarify,
   $groupNeedsYou,
+  groupChatMemberCap,
   groupSpeakerLabel,
   groupThreadOf,
   scheduleGroupChatServerSync,
@@ -685,6 +686,7 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
           {members.length > 0 && availableMembers < members.length
             ? availabilityLabel
             : b.group.memberCount(members.length)}
+          {room.discussion_policy ? ` / ${groupChatMemberCap(room)}` : null}
         </span>
       </Tip>
       <Tip label={b.group.settingsHint(group)}>

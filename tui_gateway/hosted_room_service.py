@@ -577,10 +577,10 @@ class HostedRoomService:
         self,
         room: Mapping[str, Any],
         decision: discussion.DiscussionDecision,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         if decision.discussion_event_id is None:
             return
-        hosted_rooms.append_event(
+        return hosted_rooms.append_event(
             self.db_path,
             room_id=str(room["room_id"]),
             event_id=f"dactivity:{decision.discussion_event_id}:{decision.reason}",
@@ -665,15 +665,26 @@ class HostedRoomService:
         self.prepare_room(binding)
         self.runtime.wakeup()
 
-    def create_room(self, *, room_id: str, name: str, members: Any) -> dict[str, Any]:
+    def discussion_policy(self) -> discussion.DiscussionPolicy:
+        from gateway.config import load_gateway_config
+
+        config = load_gateway_config()
+        return discussion.DiscussionPolicy.from_dict(config.hosted_rooms["discussion"])
+
+    def create_room(
+        self, *, room_id: str, name: str, members: Any, discussion_policy: Any = None
+    ) -> dict[str, Any]:
+        policy = self.discussion_policy().reduce(discussion_policy)
         normalized = discussion.validate_roster(
             members,
+            policy=policy,
             local_profiles=self.local_profiles(),
         )
         room = hosted_rooms.create_room(
             self.db_path,
             room_id=room_id,
             name=name,
+            discussion_policy=policy,
             members=[
                 {
                     "member_id": member.member_id,
@@ -712,6 +723,31 @@ class HostedRoomService:
             authority_gateway_id=str(room["authority_gateway_id"]),
             authority_epoch=int(room["authority_epoch"]),
         )
+        policy_room = discussion.validate_room(
+            room, local_profiles=self.local_profiles()
+        )
+        responders = discussion.resolve_mentions(
+            (normalized["text"],), policy_room.members
+        )
+        reason = (
+            "round_budget_too_small"
+            if len(responders) > policy_room.policy.max_turns_per_round
+            else "max_messages"
+            if len(responders) > policy_room.policy.max_messages_total
+            else None
+        )
+        if reason:
+            receipt = self._append_room_status(
+                room,
+                discussion.DiscussionDecision(
+                    status="bounded",
+                    reason=reason,
+                    discussion_event_id=event_id,
+                    source_event_seq=event["seq"],
+                    thread_id=normalized["thread_id"],
+                ),
+            )
+            return {**event, "receipt": receipt}
         binding = next(
             (
                 candidate

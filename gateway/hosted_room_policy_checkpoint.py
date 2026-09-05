@@ -44,6 +44,24 @@ class HostedRoomPolicyCheckpoint:
         self.db_path = Path(db_path)
         self._initialize()
 
+    @staticmethod
+    def _policy(conn, room_id):
+        from gateway.hosted_room_discussion_policy import DiscussionPolicy
+
+        row = conn.execute(
+            "SELECT discussion_policy_json FROM hosted_rooms WHERE room_id=?",
+            (room_id,),
+        ).fetchone()
+        return DiscussionPolicy.from_dict(json.loads(row[0]))
+
+    @classmethod
+    def _active_bound(cls, conn, room_id):
+        policy = cls._policy(conn, room_id)
+        return max(
+            MAX_ACTIVE_POLICY_EVENTS,
+            2 * policy.max_rounds * policy.max_turns_per_round + 4,
+        )
+
     def _connect(self) -> sqlite3.Connection:
         from hermes_state import apply_wal_with_fallback
 
@@ -197,7 +215,7 @@ class HostedRoomPolicyCheckpoint:
                 (
                     event["room_id"],
                     thread_id,
-                    MAX_THREAD_TRANSCRIPT_EVENTS - 1,
+                    self._policy(conn, str(event["room_id"])).max_delta_lines - 1,
                 ),
             ).fetchone()
             if cutoff is not None:
@@ -283,6 +301,9 @@ class HostedRoomPolicyCheckpoint:
                    UNION ALL
                    SELECT settled_seq FROM hosted_room_policy_transcript
                     WHERE room_id=? AND thread_id=? AND settled_seq IS NOT NULL
+                   UNION ALL
+                   SELECT seq FROM hosted_room_events
+                    WHERE room_id=? AND kind='authority.claimed'
                )
                SELECT events.room_id, events.seq, events.event_id,
                       events.kind, events.actor_json,
@@ -292,7 +313,7 @@ class HostedRoomPolicyCheckpoint:
                JOIN hosted_room_events AS events
                  ON events.room_id=? AND events.seq=transcript_events.seq
                ORDER BY events.seq""",
-            (room_id, thread_id, room_id, thread_id, room_id),
+            (room_id, thread_id, room_id, thread_id, room_id, room_id),
         ).fetchall()
         return [self._event_from_room_row(row) for row in rows]
 
@@ -545,6 +566,7 @@ class HostedRoomPolicyCheckpoint:
                     events=(),
                     watermarks={},
                 )
+            active_bound = self._active_bound(conn, room_id)
             active_rows = conn.execute(
                 """SELECT event_json FROM hosted_room_policy_events
                    WHERE room_id=? AND discussion_event_id=?
@@ -552,10 +574,10 @@ class HostedRoomPolicyCheckpoint:
                 (
                     room_id,
                     str(thread["discussion_event_id"]),
-                    MAX_ACTIVE_POLICY_EVENTS + 1,
+                    active_bound + 1,
                 ),
             ).fetchall()
-            if len(active_rows) > MAX_ACTIVE_POLICY_EVENTS:
+            if len(active_rows) > active_bound:
                 raise RuntimeError("active room policy projection exceeded its bound")
             transcript_events = self._transcript_events(
                 conn,
@@ -634,6 +656,7 @@ class HostedRoomPolicyCheckpoint:
             ).fetchone()
             if source is None:
                 return []
+            active_bound = self._active_bound(conn, room_id)
             active_rows = conn.execute(
                 """SELECT event_json FROM hosted_room_policy_events
                    WHERE room_id=? AND discussion_event_id=?
@@ -641,7 +664,7 @@ class HostedRoomPolicyCheckpoint:
                 (
                     room_id,
                     str(source["discussion_event_id"]),
-                    MAX_ACTIVE_POLICY_EVENTS + 1,
+                    active_bound + 1,
                 ),
             ).fetchall()
             transcript_events = self._transcript_events(
@@ -649,7 +672,7 @@ class HostedRoomPolicyCheckpoint:
                 room_id=room_id,
                 thread_id=str(source["thread_id"]),
             )
-        if len(active_rows) > MAX_ACTIVE_POLICY_EVENTS:
+        if len(active_rows) > active_bound:
             raise RuntimeError("task policy projection exceeded its bound")
         events_by_seq = {
             int(event["seq"]): event

@@ -430,7 +430,7 @@ def test_create_list_send_and_log_roundtrip(home):
     state = _result(srv._methods["groups.state"](3, {"room_id": "room-1"}))
     assert state["room"]["authority_gateway_id"] == _server_authority()
     assert state["room"]["authority_epoch"] == 1
-    assert state["room"]["latest_seq"] == 0
+    assert state["room"]["latest_seq"] == 1
 
     sent = _result(
         srv._methods["groups.send"](
@@ -445,7 +445,7 @@ def test_create_list_send_and_log_roundtrip(home):
     )
     assert sent["accepted"] is True
     assert sent["driver_started"] is True
-    assert sent["event"]["seq"] == 1
+    assert sent["event"]["seq"] == 2
     assert sent["event"]["kind"] == "message.user"
     assert sent["event"]["actor"] == {"kind": "user", "id": "desktop"}
 
@@ -455,8 +455,8 @@ def test_create_list_send_and_log_roundtrip(home):
             {"room_id": "room-1", "since_seq": 0},
         )
     )
-    assert replay["latest_seq"] == replay["cursor"] == 1
-    assert replay["events"][0]["payload"] == {
+    assert replay["latest_seq"] == replay["cursor"] == 2
+    assert replay["events"][1]["payload"] == {
         "text": "hello",
         "thread_id": "thread-1",
     }
@@ -512,7 +512,7 @@ def test_rpc_retry_is_idempotent_and_conflict_is_visible(home):
     first = _result(srv._methods["groups.send"](2, params))
     repeated = _result(srv._methods["groups.send"](3, params))
 
-    assert first["event"]["seq"] == repeated["event"]["seq"] == 1
+    assert first["event"]["seq"] == repeated["event"]["seq"] == 2
     assert first["client_event_id"] == repeated["client_event_id"] == "event-1"
     assert first["event"]["event_id"].startswith("user:")
     assert repeated["event"]["idempotent"] is True
@@ -613,7 +613,7 @@ def test_client_event_id_cannot_squat_disband_receipt(home, monkeypatch):
         )
     )
     kinds = [event["kind"] for event in replay["events"]]
-    assert kinds[0] == "message.user"
+    assert kinds[:2] == ["room.created", "message.user"]
     assert kinds[-1] == "room.disbanded"
     assert kinds.count("room.disbanded") == 1
 
@@ -849,6 +849,7 @@ def test_disband_tombstones_room(home):
         )
     )
     assert [event["kind"] for event in replay["events"]] == [
+        "room.created",
         "room.stop_requested",
         "room.disbanded",
     ]
@@ -1011,3 +1012,43 @@ def test_approve_routes_one_exact_peer_action(home, monkeypatch):
         "request_id": "approval-1",
         "choice": "once",
     }
+
+
+def test_room_policy_rpc_reduce_freeze_and_capabilities(home):
+    import json
+    from gateway.hosted_room_discussion_policy import DiscussionPolicy
+
+    policy = DiscussionPolicy(
+        max_members=10, max_turns_per_round=10, max_messages_total=30
+    ).to_dict()
+    (home / "config.yaml").write_text(
+        json.dumps({"gateway": {"hosted_rooms": {"discussion": policy}}})
+    )
+    for i in range(10):
+        (home / "profiles" / f"p{i}").mkdir(parents=True)
+    params = {
+        "room_id": "ten",
+        "name": "Ten",
+        "members": [
+            {"member_id": f"p{i}", "profile": f"p{i}", "handle": f"p{i}"}
+            for i in range(10)
+        ],
+        "discussion_policy": {"max_messages_total": 29},
+    }
+    room = _result(srv._methods["groups.create"](1, params))["room"]
+    assert room["discussion_policy"] == {**policy, "max_messages_total": 29}
+    assert (
+        _result(srv._methods["groups.capabilities"](2, {}))["discussion_policy"]
+        == policy
+    )
+    denied = srv._methods["groups.create"](
+        3, {**params, "room_id": "upward", "discussion_policy": {"max_members": 11}}
+    )
+    assert denied["error"]["code"] == 4110
+    (home / "config.yaml").write_text("{}")
+    assert (
+        _result(srv._methods["groups.state"](4, {"room_id": "ten"}))["room"][
+            "discussion_policy"
+        ]
+        == room["discussion_policy"]
+    )

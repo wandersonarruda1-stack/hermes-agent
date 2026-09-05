@@ -158,6 +158,8 @@ export interface GroupHold {
 }
 
 export interface GroupChat {
+  /** Frozen backend policy, also returned by groups.capabilities. */
+  discussion_policy?: { max_members: number; max_rounds: number; max_turns_per_round: number; max_messages_total: number; max_delta_lines: number }
   /** Bumped to abandon in-flight member turns from a previous round. */
   epoch?: number
   holds?: Record<string, GroupHold>

@@ -202,6 +202,8 @@ def _(rid, params: dict) -> dict:
         local_authority_gateway_id,
     )
 
+    from gateway.config import load_gateway_config
+
     service = get_hosted_room_service()
     driver_ready = bool(service and service.runtime.status()["running"])
     try:
@@ -242,6 +244,11 @@ def _(rid, params: dict) -> dict:
     return _ok(
         rid,
         {
+            "discussion_policy": (
+                service.discussion_policy().to_dict()
+                if service
+                else load_gateway_config().hosted_rooms["discussion"]
+            ),
             "protocol_version": PROTOCOL_VERSION,
             "driver": driver_ready,
             "persistent_process": bool(
@@ -522,9 +529,14 @@ def _(rid, params: dict) -> dict:
             room_id=params.get("room_id"),
             name=params.get("name"),
             members=params.get("members"),
+            **(
+                {"discussion_policy": params["discussion_policy"]}
+                if "discussion_policy" in params
+                else {}
+            ),
         )
         return _ok(rid, {"room": room})
-    except HostedRoomError as exc:
+    except (HostedRoomError, ValueError) as exc:
         reason = getattr(exc, "reason", None)
         return _err(rid, 4110, str(exc), {"reason": reason} if reason else None)
     except Exception as exc:

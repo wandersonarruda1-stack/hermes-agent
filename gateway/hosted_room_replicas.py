@@ -28,6 +28,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from gateway.hosted_room_discussion_policy import DiscussionPolicy
+
 from gateway.hosted_rooms import (
     MAX_ACTOR_ID_CHARS,
     MAX_EVENT_JSON_BYTES,
@@ -74,6 +76,14 @@ def _initialize_replica_schema(conn: sqlite3.Connection) -> None:
             updated_at REAL NOT NULL
         )"""
     )
+    if "discussion_policy_json" not in {
+        row[1] for row in conn.execute("PRAGMA table_info(hosted_room_replicas)")
+    }:
+        conn.execute(
+            "ALTER TABLE hosted_room_replicas ADD COLUMN discussion_policy_json TEXT NOT NULL DEFAULT '"
+            + DiscussionPolicy().canonical_json()
+            + "'"
+        )
     conn.execute(
         """CREATE TABLE IF NOT EXISTS hosted_room_replica_events (
             room_id TEXT NOT NULL,
@@ -177,13 +187,19 @@ def ingest_page(
     room_name = _validate_room_name(room_name)
     _, members_json = _validate_members(members)
     events, authority = _validate_page(page)
+    try:
+        policy_json = DiscussionPolicy.from_dict(
+            page.get("discussion_policy")
+        ).canonical_json()
+    except ValueError as exc:
+        raise ReplicaError(str(exc)) from exc
     now = time.time() if now is None else float(now)
     _ensure_schema(db_path)
 
     with _replica_transaction(db_path) as conn:
         _initialize_replica_schema(conn)
         row = conn.execute(
-            """SELECT authority_gateway_id, authority_epoch, last_seq,
+            """SELECT discussion_policy_json, authority_gateway_id, authority_epoch, last_seq,
                       latest_seq, event_bytes
                  FROM hosted_room_replicas WHERE room_id=?""",
             (room_id,),
@@ -198,6 +214,8 @@ def ingest_page(
             last_seq = 0
             stored_bytes = 0
         else:
+            if row["discussion_policy_json"] != policy_json:
+                raise ReplicaError("replica discussion policy changed")
             stored_epoch = int(row["authority_epoch"])
             last_seq = int(row["last_seq"])
             stored_bytes = int(row["event_bytes"])
@@ -248,14 +266,15 @@ def ingest_page(
         if row is None:
             conn.execute(
                 """INSERT INTO hosted_room_replicas
-                   (room_id, name, members_json, authority_gateway_id,
+                   (room_id, name, members_json, discussion_policy_json, authority_gateway_id,
                     authority_epoch, last_seq, latest_seq, event_bytes,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     room_id,
                     room_name,
                     members_json,
+                    policy_json,
                     authority["gateway_id"],
                     authority["epoch"],
                     new_last,
@@ -302,7 +321,7 @@ def replica_state(db_path: Path | str, *, room_id: Any) -> dict[str, Any]:
     with _replica_transaction(db_path) as conn:
         _initialize_replica_schema(conn)
         row = conn.execute(
-            """SELECT room_id, name, members_json, authority_gateway_id,
+            """SELECT room_id, name, members_json, discussion_policy_json, authority_gateway_id,
                       authority_epoch, last_seq, latest_seq, event_bytes,
                       created_at, updated_at
                  FROM hosted_room_replicas WHERE room_id=?""",
@@ -314,6 +333,7 @@ def replica_state(db_path: Path | str, *, room_id: Any) -> dict[str, Any]:
         "room_id": row["room_id"],
         "name": row["name"],
         "members": json.loads(row["members_json"]),
+        "discussion_policy": json.loads(row["discussion_policy_json"]),
         "authority": {
             "gateway_id": row["authority_gateway_id"],
             "epoch": int(row["authority_epoch"]),
@@ -355,7 +375,7 @@ def promote_replica(
     with _replica_transaction(db_path) as conn:
         _initialize_replica_schema(conn)
         replica = conn.execute(
-            """SELECT room_id, name, members_json, authority_gateway_id,
+            """SELECT room_id, name, members_json, discussion_policy_json, authority_gateway_id,
                       authority_epoch, last_seq, event_bytes
                  FROM hosted_room_replicas WHERE room_id=?""",
             (room_id,),
@@ -407,14 +427,15 @@ def promote_replica(
 
         conn.execute(
             """INSERT INTO hosted_rooms
-               (room_id, name, members_json, authority_gateway_id,
+               (room_id, name, members_json, discussion_policy_json, authority_gateway_id,
                 authority_epoch, next_seq, event_bytes, revision,
                 created_at, updated_at, disbanded_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL)""",
             (
                 room_id,
                 replica["name"],
                 replica["members_json"],
+                replica["discussion_policy_json"],
                 local_gateway,
                 target_epoch,
                 claim_seq + 1,

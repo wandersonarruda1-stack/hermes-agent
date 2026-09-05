@@ -385,12 +385,13 @@ def test_create_send_drive_publish_and_replay_without_client_transport(tmp_path:
     assert service.stop(timeout=1.0)
 
     events = service._events("room-1")
-    assert [event["kind"] for event in events][:3] == [
+    assert [event["kind"] for event in events][:4] == [
+        "room.created",
         "message.user",
         "message.member",
         "turn.settled",
     ]
-    assert events[1]["payload"]["text"] == "reply from ops"
+    assert events[2]["payload"]["text"] == "reply from ops"
     assert service.status("room-1")["working"] is False
 
 
@@ -444,7 +445,7 @@ def test_restart_republishes_terminal_task_before_admitting_more(tmp_path: Path)
 
     service.prepare_room(binding)
     events = service._events("room-1")
-    assert event["seq"] == 1
+    assert event["seq"] == 2
     assert sum(row["kind"] == "message.member" for row in events) == 1
     assert sum(row["kind"] == "turn.settled" for row in events) == 1
     service.prepare_room(binding)
@@ -470,7 +471,7 @@ def test_policy_checkpoint_bounds_replay_after_completed_room_history(
     authority = str(room["authority_gateway_id"])
     rows = []
     for index in range(200):
-        user_seq = index * 2 + 1
+        user_seq = index * 2 + 2
         activity_seq = user_seq + 1
         thread_id = f"thread-{index}"
         event_id = f"user-{index}"
@@ -511,7 +512,7 @@ def test_policy_checkpoint_bounds_replay_after_completed_room_history(
         )
         conn.execute(
             """UPDATE hosted_rooms
-               SET next_seq=401, revision=revision+400, updated_at=400
+               SET next_seq=402, revision=revision+400, updated_at=400
                WHERE room_id='room-1'"""
         )
     _append_room_event(
@@ -536,7 +537,7 @@ def test_policy_checkpoint_bounds_replay_after_completed_room_history(
     monkeypatch.setattr(hosted_rooms, "read_events", counted_read_events)
     binding = service.bindings()[0]
     service.prepare_room(binding)
-    assert reads["rows"] == 401
+    assert reads["rows"] == 402
     snapshot = service._policy_snapshot(hosted_rooms.room_state(db, room_id="room-1"))
     assert len(snapshot.events) == 1
     assert len(snapshot.events) <= MAX_ACTIVE_POLICY_EVENTS
@@ -2073,3 +2074,190 @@ def test_peer_recovery_replays_the_same_execution_generation(tmp_path: Path):
     assert recovered["task_id"] == "task-1"
     assert recovered["execution_generation"] == 1
     assert recovered["prompt"] == "Recover the accepted review."
+
+
+@pytest.mark.parametrize("n", [7, 10])
+def test_configured_roster_runtime_receipts_and_replay(tmp_path, n):
+    db = tmp_path / "state.db"
+    profiles = tuple(f"p{i}" for i in range(n))
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: profiles
+    service.discussion_policy = lambda: discussion.DiscussionPolicy(
+        max_members=n, max_turns_per_round=n, max_messages_total=30
+    )
+    service.rpc = _PromptRecordingRPC()
+    service.runtime.rpc = service.rpc
+    room = service.create_room(
+        room_id="room-budget",
+        name="Budget",
+        members=[{"member_id": p, "profile": p, "handle": p} for p in profiles],
+    )
+    assert room["discussion_policy"]["max_members"] == n
+    try:
+        service.start()
+        for _ in range(2):
+            service.send(
+                room_id="room-budget",
+                event_id="input",
+                payload={"text": "Report", "thread_id": "thread"},
+            )
+        _wait_for(
+            lambda: (
+                len([
+                    e
+                    for e in service._events("room-budget")
+                    if e["kind"] == "turn.settled"
+                ])
+                == n
+            ),
+            timeout=10,
+        )
+    finally:
+        assert service.stop(timeout=2)
+    assert len(service.rpc.prompts) == n
+    settled = [e for e in service._events("room-budget") if e["kind"] == "turn.settled"]
+    assert len({e["payload"]["task_id"] for e in settled}) == n
+
+
+def test_budget_receipt_without_llm_and_idempotent_replay(tmp_path):
+    service = HostedRoomService(_server(), db_path=tmp_path / "state.db")
+    profiles = tuple(f"p{i}" for i in range(10))
+    service.local_profiles = lambda: profiles
+    service.discussion_policy = lambda: discussion.DiscussionPolicy(
+        max_members=10, max_turns_per_round=7, max_messages_total=30
+    )
+    service.rpc = _PromptRecordingRPC()
+    service.runtime.rpc = service.rpc
+    service.create_room(
+        room_id="bounded",
+        name="Bounded",
+        members=[{"member_id": p, "profile": p, "handle": p} for p in profiles],
+    )
+    result = service.send(
+        room_id="bounded",
+        event_id="input",
+        payload={"text": "Report", "thread_id": "thread"},
+    )
+    again = service.send(
+        room_id="bounded",
+        event_id="input",
+        payload={"text": "Report", "thread_id": "thread"},
+    )
+    assert result["receipt"]["event_id"] == again["receipt"]["event_id"]
+    assert result["receipt"]["payload"]["reason_code"] == "round_budget_too_small"
+    service.prepare_room(service.bindings()[0])
+    assert driver.list_tasks(service.db_path, room_id="bounded") == []
+    assert service.rpc.prompts == []
+    assert (
+        len([e for e in service._events("bounded") if e["kind"] == "room.activity"])
+        == 1
+    )
+
+
+def test_ten_members_two_peers_partial_outage_isolated(tmp_path):
+    good = _FakePeerClient()
+    failed = _UnavailablePeerClient()
+    routes, peers, members = {}, {}, []
+    for name, client in (("brian", good), ("other", failed)):
+        install = f"install-{name}"
+        routes[("mixed", name)] = PeerMemberRoute(
+            home_install_id="install-home",
+            member_id=name,
+            target_install_id=install,
+            target_profile="reviewer",
+            capability_digest="a" * 64,
+            execution_policy_digest="b" * 64,
+            cancellation_scope_id="cancel-mixed",
+            trace_id="trace-mixed",
+            grant="test-only-grant",
+        )
+        peers[install] = client
+        members.append({
+            "member_id": name,
+            "profile": "reviewer",
+            "handle": name,
+            "target": {
+                "kind": "peer",
+                "peer_id": name,
+                "installation_id": install,
+                "profile": "reviewer",
+                "capability_digest": "a" * 64,
+            },
+        })
+    profiles = tuple(f"p{i}" for i in range(8))
+    members.extend({"member_id": p, "profile": p, "handle": p} for p in profiles)
+    service = HostedRoomService(
+        _server(), db_path=tmp_path / "state.db", peer_routes=routes, peer_clients=peers
+    )
+    service.local_profiles = lambda: profiles
+    service.discussion_policy = lambda: discussion.DiscussionPolicy(
+        max_members=10, max_turns_per_round=10, max_messages_total=30
+    )
+    service.rpc = _PromptRecordingRPC()
+    service.runtime.rpc = service.rpc
+    service.create_room(room_id="mixed", name="Mixed", members=members)
+    try:
+        service.start()
+        service.send(
+            room_id="mixed",
+            event_id="input",
+            payload={"text": "Report", "thread_id": "thread"},
+        )
+        _wait_for(
+            lambda: (
+                len([
+                    e
+                    for e in service._events("mixed")
+                    if e["kind"] in {"turn.settled", "turn.failed"}
+                ])
+                == 10
+            ),
+            timeout=10,
+        )
+    finally:
+        assert service.stop(timeout=2)
+    assert len(good.dispatches) == 1
+    assert len(service.rpc.prompts) == 8
+    assert any(
+        e["kind"] == "turn.failed" and e["payload"]["member_id"] == "other"
+        for e in service._events("mixed")
+    )
+
+
+def test_worker_restart_after_seventh_settlement_keeps_eighth_task(tmp_path):
+    db = tmp_path / "state.db"
+    profiles = tuple(f"p{i}" for i in range(10))
+    rpc = _PromptRecordingRPC()
+
+    def worker():
+        service = HostedRoomService(_server(), db_path=db)
+        service.local_profiles = lambda: profiles
+        service.rpc = rpc
+        service.runtime.rpc = rpc
+        return service
+
+    first = worker()
+    first.discussion_policy = lambda: discussion.DiscussionPolicy(max_members=10, max_turns_per_round=10, max_messages_total=30)
+    first.create_room(room_id="restart", name="Restart", members=[{"member_id": p, "profile": p, "handle": p} for p in profiles])
+    first.send(room_id="restart", event_id="input", payload={"text": "Report", "thread_id": "thread"})
+    binding = first.bindings()[0]
+    # Drive exactly seven real runtime cycles, with mock model transport.
+    for _ in range(7):
+        first.runtime._run_room_once(binding)
+    first.prepare_room(binding)
+    assert len(rpc.prompts) == 7
+    eighth = driver.list_tasks(db, room_id="restart", status="queued")[0]["identity"]
+    assert first.stop(timeout=1)
+    first.runtime._release_idle_leases()
+    second = worker()  # Compiled default six; the existing room still has ten.
+    assert second.runtime.process_generation != first.runtime.process_generation
+    second.prepare_room(binding)
+    assert driver.list_tasks(db, room_id="restart", status="queued")[0]["identity"] == eighth
+    for _ in range(3):
+        second.runtime._run_room_once(binding)
+    second.prepare_room(binding)
+    second.runtime._release_idle_leases()
+    assert second.stop(timeout=1)
+    assert len(rpc.prompts) == 10
+    settlements = [e for e in second._events("restart") if e["kind"] == "turn.settled"]
+    assert len(settlements) == len({e["payload"]["task_id"] for e in settlements}) == 10

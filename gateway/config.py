@@ -13,6 +13,7 @@ import math
 import os
 import json
 from pathlib import Path
+from gateway.hosted_room_discussion_policy import DiscussionPolicy
 from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Dict, List, Optional, Any, Callable
 from enum import Enum
@@ -930,6 +931,12 @@ class GatewayConfig:
     
     Manages all platform connections, session policies, and delivery settings.
     """
+
+    # Validated operator ceilings; each room persists its own immutable copy.
+    hosted_rooms: Dict[str, Any] = field(
+        default_factory=lambda: {"discussion": DiscussionPolicy().to_dict()}
+    )
+
     # Platform configurations
     platforms: Dict[Platform, PlatformConfig] = field(default_factory=dict)
     
@@ -1131,13 +1138,10 @@ class GatewayConfig:
     
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "platforms": {
-                p.value: c.to_dict() for p, c in self.platforms.items()
-            },
+            "hosted_rooms": self.hosted_rooms,
+            "platforms": {p.value: c.to_dict() for p, c in self.platforms.items()},
             "default_reset_policy": self.default_reset_policy.to_dict(),
-            "reset_by_type": {
-                k: v.to_dict() for k, v in self.reset_by_type.items()
-            },
+            "reset_by_type": {k: v.to_dict() for k, v in self.reset_by_type.items()},
             "reset_by_platform": {
                 p.value: v.to_dict() for p, v in self.reset_by_platform.items()
             },
@@ -1319,7 +1323,12 @@ class GatewayConfig:
         from gateway.profile_routing import parse_profile_routes
         profile_routes = parse_profile_routes(data.get("profile_routes") or [])
 
+        hosted = data.get("hosted_rooms", {})
+        if not isinstance(hosted, dict) or set(hosted) - {"discussion"}:
+            raise ValueError("hosted_rooms must be a mapping with discussion policy")
+        policy = DiscussionPolicy.from_dict(hosted.get("discussion"))
         return cls(
+            hosted_rooms={"discussion": policy.to_dict()},
             platforms=platforms,
             default_reset_policy=default_policy,
             reset_by_type=reset_by_type,
@@ -1431,6 +1440,8 @@ def load_gateway_config() -> GatewayConfig:
             # already established for gateway.multiplex_profiles/streaming/
             # write_sessions_json: top-level wins, nested gateway.* falls back.
             gateway_section = yaml_cfg.get("gateway")
+            if isinstance(gateway_section, dict) and "hosted_rooms" in gateway_section:
+                gw_data["hosted_rooms"] = gateway_section["hosted_rooms"]
 
             # Map config.yaml keys → GatewayConfig.from_dict() schema.
             # Each key overwrites whatever gateway.json may have set.
