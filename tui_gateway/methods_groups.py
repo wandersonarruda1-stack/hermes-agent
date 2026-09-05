@@ -249,6 +249,9 @@ def _(rid, params: dict) -> dict:
                 if service
                 else load_gateway_config().hosted_rooms["discussion"]
             ),
+            "lineage": {"supported_versions": [0, 1], "max_depth": 4,
+                        "authenticated_principal_required": True,
+                        "return_mode": "room.activity"},
             "protocol_version": PROTOCOL_VERSION,
             "driver": driver_ready,
             "persistent_process": bool(
@@ -512,6 +515,13 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5110, str(exc))
 
 
+def _lineage_principal():
+    from .transport import current_transport
+    from .methods_browser_control import _is_authenticated_identity, _principal_digest
+    identity = getattr(current_transport(), "auth_identity", None)
+    return _principal_digest(identity) if _is_authenticated_identity(identity) else None
+
+
 @method("groups.create")
 def _(rid, params: dict) -> dict:
     """Create a hosted room idempotently.
@@ -520,6 +530,7 @@ def _(rid, params: dict) -> dict:
     derived from this gateway's stable install identity, never from the client.
     """
     from gateway.hosted_rooms import HostedRoomError
+    from tui_gateway.methods_groups import _lineage_principal
 
     try:
         service = get_hosted_room_service()
@@ -529,6 +540,8 @@ def _(rid, params: dict) -> dict:
             room_id=params.get("room_id"),
             name=params.get("name"),
             members=params.get("members"),
+            **({"lineage_version": params["lineage_version"],
+                "principal": _lineage_principal()} if "lineage_version" in params else {}),
             **(
                 {"discussion_policy": params["discussion_policy"]}
                 if "discussion_policy" in params
@@ -583,6 +596,7 @@ def _(rid, params: dict) -> dict:
     Admission is durable; no Bot turn is started by this slice.
     """
     from gateway.hosted_rooms import HostedRoomError, user_event_id
+    from tui_gateway.methods_groups import _lineage_principal
 
     try:
         client_event_id = params.get("event_id")
@@ -593,6 +607,7 @@ def _(rid, params: dict) -> dict:
             room_id=params.get("room_id"),
             event_id=user_event_id(client_event_id),
             payload=params.get("payload"),
+            **({"principal": _lineage_principal()} if _lineage_principal() else {}),
         )
         return _ok(
             rid,

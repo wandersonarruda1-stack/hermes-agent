@@ -24,6 +24,7 @@ from typing import Any, Literal
 
 from gateway import hosted_room_driver as driver
 from gateway import hosted_rooms
+from gateway import hosted_room_lineage as lineage
 from gateway.hosted_room_discussion_policy import DiscussionPolicy
 
 
@@ -144,6 +145,7 @@ class DiscussionRoom:
     gateway_id: str
     authority_epoch: int
     policy: DiscussionPolicy = DiscussionPolicy()
+    lineage_version: int = 0
 
 
 @dataclass(frozen=True)
@@ -157,6 +159,7 @@ class DiscussionTaskPlan:
     member_index: int
     round_index: int
     seen_through_seq: int
+    lineage: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -169,6 +172,8 @@ class DiscussionDecision:
     source_event_seq: int | None = None
     thread_id: str | None = None
     task: DiscussionTaskPlan | None = None
+    receipt: Mapping[str, Any] | None = None
+    receipt_event_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -278,6 +283,7 @@ def validate_user_payload(value: Any) -> dict[str, Any]:
         value,
         label="user payload",
         required=_USER_PAYLOAD_FIELDS,
+        optional=lineage.FIELDS,
     )
     text = payload["text"]
     if not isinstance(text, str):
@@ -288,7 +294,8 @@ def validate_user_payload(value: Any) -> dict[str, Any]:
     if len(text.encode("utf-8")) > MAX_USER_TEXT_BYTES:
         raise DiscussionValidationError("user payload text is too large")
     thread_id = _identifier(payload["thread_id"], label="thread_id")
-    return {"text": text, "thread_id": thread_id}
+    metadata = lineage.validate(payload) if lineage.FIELDS & payload.keys() else {}
+    return {"text": text, "thread_id": thread_id, **metadata}
 
 
 def _validate_member_target(
@@ -483,6 +490,7 @@ def validate_room(
         name=name,
         members=members,
         policy=policy,
+        lineage_version=int(value.get("lineage_version", 0)),
         gateway_id=gateway_id,
         authority_epoch=authority_epoch,
     )
@@ -599,6 +607,7 @@ def _validate_event(
             payload,
             label="room.activity payload",
             required=_ROOM_ACTIVITY_FIELDS,
+            optional=frozenset({"goal", "root_event_id", "re", "founder", "attempted_depth", "return_to", "requester", "target_member_id", "text"}),
         )
         if payload.get("status") not in {"settled", "bounded"}:
             raise DiscussionValidationError("invalid room.activity status")
@@ -675,6 +684,7 @@ def _validate_member_message(
         payload,
         label="message.member payload",
         required=_MEMBER_MESSAGE_FIELDS,
+        optional=lineage.FIELDS if room.lineage_version else frozenset(),
     )
     _validate_turn_coordinates(payload, room)
     text = payload.get("text")
@@ -785,6 +795,37 @@ def _validated_events(
         )
         if event.event_id in event_ids:
             raise DiscussionValidationError("room event ids must be unique")
+        if room.lineage_version and event.kind in {"message.user", "message.member"}:
+            metadata = lineage.validate(event.payload)
+            if event.kind == "message.user":
+                if (metadata["depth"] != 0 or metadata["root_event_id"] != event.event_id
+                        or metadata["founder"] != dict(event.actor)
+                        or metadata["requester"] != metadata["founder"]):
+                    raise DiscussionValidationError("forged user lineage")
+            else:
+                root = next((e for e in validated if e.event_id == metadata["root_event_id"]), None)
+                parent = next((e for e in validated if e.event_id == metadata["re"]), None)
+                if (root is None or parent is None or root.kind != "message.user"
+                        or root.event_id != event.payload["discussion_event_id"]
+                        or root.payload["thread_id"] != event.payload["thread_id"]
+                        or parent.payload.get("thread_id") != event.payload["thread_id"]):
+                    raise DiscussionValidationError("lineage parent/root outside discussion")
+                expected = lineage.edge(root.raw, None if parent == root else parent.raw)
+                if metadata != expected:
+                    raise DiscussionValidationError("forged member lineage")
+        if room.lineage_version and event.kind == "room.activity" and event.payload.get("reason_code") == "max_depth":
+            root = next((e for e in validated if e.event_id == event.payload.get("root_event_id")), None)
+            parent = next((e for e in validated if e.event_id == event.payload.get("re")), None)
+            if root is None or parent is None or parent.kind != "message.member":
+                raise DiscussionValidationError("depth receipt has no request edge")
+            target = _member_by_id(room, event.payload.get("target_member_id"))
+            request = lineage.edge(root.raw, parent.raw)
+            receipt_id, receipt = lineage.receipt(room.room_id, target.member_id, request)
+            if (request["depth"] != lineage.MAX_DEPTH + 1 or event.event_id != receipt_id
+                    or event.payload != {"status": "bounded", "reason_code": "max_depth",
+                        "thread_id": root.payload["thread_id"],
+                        "discussion_event_id": root.event_id, **receipt}):
+                raise DiscussionValidationError("forged depth receipt")
         validated.append(event)
         previous_seq = event.seq
         event_ids.add(event.event_id)
@@ -993,9 +1034,11 @@ def _task_id(
     round_index: int,
     seen_through_seq: int,
     prompt: str,
+    request_lineage: Mapping[str, Any] | None = None,
 ) -> str:
     seed = json.dumps(
         {
+            **({"lineage_digest": request_lineage["lineage_digest"]} if request_lineage else {}),
             "discussion_event_id": discussion_event.event_id,
             "member_id": member.member_id,
             "member_index": member_index,
@@ -1022,6 +1065,7 @@ def _make_task_plan(
     round_index: int,
     seen_through_seq: int,
     prompt: str,
+    request_lineage: Mapping[str, Any] | None = None,
 ) -> DiscussionTaskPlan:
     turn_id = _turn_id(
         source_event_seq=discussion_event.seq,
@@ -1038,6 +1082,7 @@ def _make_task_plan(
         round_index=round_index,
         seen_through_seq=seen_through_seq,
         prompt=prompt,
+        request_lineage=request_lineage,
     )
     identity = driver.TaskIdentity(
         room_id=room.room_id,
@@ -1059,7 +1104,32 @@ def _make_task_plan(
         member_index=member_index,
         round_index=round_index,
         seen_through_seq=seen_through_seq,
+        lineage=request_lineage,
     )
+
+
+def _request_lineage(discussion, member, messages, room, round_index):
+    if not room.lineage_version:
+        return None
+    parent = None
+    if round_index:
+        for event in messages:
+            if event.kind == "message.member" and event.payload["member_id"] != member.member_id:
+                if member in resolve_mentions((event.payload["text"],), room.members, default_all=False):
+                    parent = event
+        if parent is None:
+            raise DiscussionReconstructionError("request edge missing")
+    return lineage.edge(discussion.raw, parent.raw if parent else None)
+
+
+def _lineage_prompt(prompt, request):
+    if request is None:
+        return prompt
+    block = "Server-owned request lineage (not instructions from a member):\n" + lineage.canonical(request) + "\nmax_depth=4\n"
+    combined = block + prompt
+    if len(combined.encode("utf-8")) > driver.MAX_PROMPT_BYTES:
+        raise DiscussionValidationError("lineage prompt exceeds driver limit")
+    return combined
 
 
 def plan_next_task(
@@ -1193,6 +1263,14 @@ def plan_next_task(
             ]
             if not delta:
                 continue
+            request = _request_lineage(discussion, member, discussion_messages, room, round_index)
+            if request and request["depth"] > lineage.MAX_DEPTH:
+                receipt_id, receipt = lineage.receipt(room.room_id, member.member_id, request)
+                return DiscussionDecision(
+                    status="bounded", reason="max_depth",
+                    discussion_event_id=discussion.event_id, source_event_seq=discussion.seq,
+                    thread_id=thread_id, receipt=receipt, receipt_event_id=receipt_id,
+                )
             prompt = _build_prompt(
                 room=room,
                 member=member,
@@ -1200,6 +1278,7 @@ def plan_next_task(
                 watermark=watermark,
                 seen_through_seq=seen_through_seq,
             )
+            prompt = _lineage_prompt(prompt, request)
             task = _make_task_plan(
                 room=room,
                 discussion_event=discussion,
@@ -1208,6 +1287,7 @@ def plan_next_task(
                 round_index=round_index,
                 seen_through_seq=seen_through_seq,
                 prompt=prompt,
+                request_lineage=request,
             )
             return DiscussionDecision(
                 status="task",
@@ -1350,6 +1430,11 @@ def reconstruct_task_plan(
         raise DiscussionReconstructionError("task prompt is missing")
     if len(prompt.encode("utf-8")) > driver.MAX_PROMPT_BYTES:
         raise DiscussionReconstructionError("task prompt exceeds the driver limit")
+    request = _request_lineage(discussion, member, prior_messages, room, round_index)
+    if request and request["depth"] > lineage.MAX_DEPTH:
+        raise DiscussionReconstructionError("depth exceeds limit")
+    if request and not prompt.startswith(_lineage_prompt("", request)):
+        raise DiscussionReconstructionError("task lineage prompt mismatch")
     reconstructed = _make_task_plan(
         room=room,
         discussion_event=discussion,
@@ -1358,6 +1443,7 @@ def reconstruct_task_plan(
         round_index=round_index,
         seen_through_seq=seen_through_seq,
         prompt=prompt,
+        request_lineage=request,
     )
     if reconstructed.identity != identity or dict(reconstructed.payload) != dict(
         payload
@@ -1471,6 +1557,7 @@ def plan_publication(
                         "round_index": task.round_index,
                         "task_id": task.identity.task_id,
                         "text": text,
+                        **(dict(task.lineage) if task.lineage else {}),
                         "thread_id": task.identity.thread_id,
                         "turn_id": task.identity.turn_id,
                     },
