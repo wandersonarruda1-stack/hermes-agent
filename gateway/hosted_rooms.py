@@ -57,6 +57,7 @@ _ROOM_SCHEMA_COLUMNS = frozenset({
     "name",
     "members_json",
     "discussion_policy_json",
+    "lineage_version",
     "authority_gateway_id",
     "authority_epoch",
     "next_seq",
@@ -456,6 +457,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             disbanded_at REAL
         )"""
     )
+    if "lineage_version" not in {row[1] for row in conn.execute("PRAGMA table_info(hosted_rooms)")}:
+        conn.execute("ALTER TABLE hosted_rooms ADD COLUMN lineage_version INTEGER NOT NULL DEFAULT 0")
     if "discussion_policy_json" not in {
         row[1] for row in conn.execute("PRAGMA table_info(hosted_rooms)")
     }:
@@ -1233,6 +1236,7 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 def _room_from_row(row: sqlite3.Row, *, idempotent: bool = False) -> dict[str, Any]:
     room = {
         "room_id": row["room_id"],
+        "lineage_version": int(row["lineage_version"]),
         "name": row["name"],
         "members": json.loads(row["members_json"]),
         "discussion_policy": DiscussionPolicy.from_dict(
@@ -1435,9 +1439,12 @@ def create_room(
     members: Any,
     authority_gateway_id: Any,
     discussion_policy: Any = None,
+    lineage_version: int = 0,
     now: float | None = None,
 ) -> dict[str, Any]:
     """Create a room, or return the identical existing room idempotently."""
+    if type(lineage_version) is not int or lineage_version not in (0, 1):
+        raise HostedRoomError("unsupported lineage_version")
     policy_json = DiscussionPolicy.from_dict(discussion_policy).canonical_json()
     room_id = _validate_identifier(
         room_id,
@@ -1460,7 +1467,7 @@ def create_room(
         ).fetchone():
             raise RoomConflictError("room_id belongs to a disbanded room")
         existing = conn.execute(
-            """SELECT room_id, name, members_json, discussion_policy_json, authority_gateway_id,
+            """SELECT room_id, name, members_json, discussion_policy_json, lineage_version, authority_gateway_id,
                       authority_epoch, next_seq, event_bytes, revision,
                       created_at, updated_at, disbanded_at
                FROM hosted_rooms WHERE room_id=?""",
@@ -1481,6 +1488,7 @@ def create_room(
                 existing["name"] != name
                 or not members_match
                 or existing["discussion_policy_json"] != policy_json
+                or existing["lineage_version"] != lineage_version
             ):
                 raise RoomConflictError("room_id already exists with different state")
             if legacy_adoption:
@@ -1549,7 +1557,7 @@ def create_room(
                 if adopted.rowcount != 1:
                     raise AuthorityConflictError("legacy room adoption lost its fence")
                 existing = conn.execute(
-                    """SELECT room_id, name, members_json, discussion_policy_json, authority_gateway_id,
+                    """SELECT room_id, name, members_json, discussion_policy_json, lineage_version, authority_gateway_id,
                               authority_epoch, next_seq, revision, created_at,
                               updated_at, disbanded_at
                          FROM hosted_rooms WHERE room_id=?""",
@@ -1588,20 +1596,20 @@ def create_room(
 
         conn.execute(
             """INSERT INTO hosted_rooms
-               (room_id, name, members_json, discussion_policy_json, authority_gateway_id,
+               (room_id, name, members_json, discussion_policy_json, lineage_version, authority_gateway_id,
                 authority_epoch, next_seq, event_bytes, revision,
                 created_at, updated_at, disbanded_at)
-               VALUES (?, ?, ?, ?, ?, 1, 1, 0, 1, ?, ?, NULL)""",
-            (room_id, name, members_json, policy_json, authority_gateway_id, now, now),
+               VALUES (?, ?, ?, ?, ?, ?, 1, 1, 0, 1, ?, ?, NULL)""",
+            (room_id, name, members_json, policy_json, lineage_version, authority_gateway_id, now, now),
         )
-        if discussion_policy is not None:
+        if discussion_policy is not None or lineage_version:
             actor_json = _canonical_json(
                 {"kind": "system", "id": authority_gateway_id},
                 label="actor",
                 max_bytes=4096,
             )
             payload_json = _canonical_json(
-                {"discussion_policy": json.loads(policy_json)},
+                {"discussion_policy": json.loads(policy_json), "lineage_version": lineage_version},
                 label="payload",
                 max_bytes=MAX_EVENT_JSON_BYTES,
             )
@@ -1620,7 +1628,7 @@ def create_room(
                 (size, room_id),
             )
         row = conn.execute(
-            """SELECT room_id, name, members_json, discussion_policy_json, authority_gateway_id,
+            """SELECT room_id, name, members_json, discussion_policy_json, lineage_version, authority_gateway_id,
                       authority_epoch, revision, created_at, updated_at
                FROM hosted_rooms WHERE room_id=?""",
             (room_id,),
@@ -1651,7 +1659,7 @@ def list_rooms(
     conn = _read_connection(db_path)
     try:
         rows = conn.execute(
-            """SELECT room_id, name, members_json, discussion_policy_json, authority_gateway_id,
+            """SELECT room_id, name, members_json, discussion_policy_json, lineage_version, authority_gateway_id,
                       authority_epoch, next_seq, revision, created_at, updated_at,
                       disbanded_at
                FROM hosted_rooms
@@ -1692,7 +1700,7 @@ def rename_room(
     )
     with _transaction(db_path, immediate=True) as conn:
         room = conn.execute(
-            """SELECT room_id, name, members_json, discussion_policy_json, authority_gateway_id,
+            """SELECT room_id, name, members_json, discussion_policy_json, lineage_version, authority_gateway_id,
                       authority_epoch, next_seq, event_bytes, revision, created_at,
                       updated_at, disbanded_at
                  FROM hosted_rooms WHERE room_id=?""",
@@ -1740,7 +1748,7 @@ def rename_room(
             (room_id, seq, event_id, actor_json, epoch, payload_json, now),
         )
         updated = conn.execute(
-            """SELECT room_id, name, members_json, discussion_policy_json, authority_gateway_id,
+            """SELECT room_id, name, members_json, discussion_policy_json, lineage_version, authority_gateway_id,
                       authority_epoch, next_seq, revision, created_at,
                       updated_at, disbanded_at
                  FROM hosted_rooms WHERE room_id=?""",
@@ -2018,7 +2026,7 @@ def room_state(
     )
     with _transaction(db_path) as conn:
         row = conn.execute(
-            """SELECT room_id, name, members_json, discussion_policy_json, authority_gateway_id,
+            """SELECT room_id, name, members_json, discussion_policy_json, lineage_version, authority_gateway_id,
                       authority_epoch, next_seq, revision, created_at, updated_at,
                       disbanded_at
                  FROM hosted_rooms
@@ -2221,7 +2229,7 @@ def claim_authority(
                 (room_id, event_id),
             ).fetchone()
         state_row = conn.execute(
-            """SELECT room_id, name, members_json, discussion_policy_json, authority_gateway_id,
+            """SELECT room_id, name, members_json, discussion_policy_json, lineage_version, authority_gateway_id,
                       authority_epoch, next_seq, revision, created_at, updated_at
                  FROM hosted_rooms WHERE room_id=?""",
             (room_id,),
@@ -2420,7 +2428,7 @@ def read_events(
 
     with _transaction(db_path) as conn:
         room = conn.execute(
-            """SELECT next_seq, discussion_policy_json, authority_gateway_id, authority_epoch
+            """SELECT next_seq, discussion_policy_json, lineage_version, authority_gateway_id, authority_epoch
                FROM hosted_rooms
                WHERE room_id=? AND (disbanded_at IS NULL OR ?)""",
             (room_id, int(include_disbanded)),
@@ -2463,6 +2471,7 @@ def read_events(
             "latest_seq": latest_seq,
             "has_more": cursor < latest_seq,
             "discussion_policy": json.loads(room["discussion_policy_json"]),
+            "lineage_version": int(room["lineage_version"]),
             "authority": {
                 "gateway_id": authority_gateway,
                 "epoch": authority_epoch,

@@ -498,6 +498,7 @@ def test_since_seq_returns_ordered_deltas_and_stable_cursor(tmp_path):
         "events": first["events"],
         "cursor": 2,
         "discussion_policy": rooms.DiscussionPolicy().to_dict(),
+        "lineage_version": 0,
         "latest_seq": 4,
         "has_more": True,
         "authority": {"gateway_id": "gateway-a", "epoch": 1},

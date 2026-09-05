@@ -76,6 +76,8 @@ def _initialize_replica_schema(conn: sqlite3.Connection) -> None:
             updated_at REAL NOT NULL
         )"""
     )
+    if "lineage_version" not in {row[1] for row in conn.execute("PRAGMA table_info(hosted_room_replicas)")}:
+        conn.execute("ALTER TABLE hosted_room_replicas ADD COLUMN lineage_version INTEGER NOT NULL DEFAULT 0")
     if "discussion_policy_json" not in {
         row[1] for row in conn.execute("PRAGMA table_info(hosted_room_replicas)")
     }:
@@ -187,6 +189,9 @@ def ingest_page(
     room_name = _validate_room_name(room_name)
     _, members_json = _validate_members(members)
     events, authority = _validate_page(page)
+    lineage_version = page.get("lineage_version", 0)
+    if type(lineage_version) is not int or lineage_version not in (0, 1):
+        raise ReplicaError("unsupported lineage version")
     try:
         policy_json = DiscussionPolicy.from_dict(
             page.get("discussion_policy")
@@ -199,7 +204,7 @@ def ingest_page(
     with _replica_transaction(db_path) as conn:
         _initialize_replica_schema(conn)
         row = conn.execute(
-            """SELECT discussion_policy_json, authority_gateway_id, authority_epoch, last_seq,
+            """SELECT discussion_policy_json, lineage_version, authority_gateway_id, authority_epoch, last_seq,
                       latest_seq, event_bytes
                  FROM hosted_room_replicas WHERE room_id=?""",
             (room_id,),
@@ -214,7 +219,7 @@ def ingest_page(
             last_seq = 0
             stored_bytes = 0
         else:
-            if row["discussion_policy_json"] != policy_json:
+            if row["discussion_policy_json"] != policy_json or row["lineage_version"] != lineage_version:
                 raise ReplicaError("replica discussion policy changed")
             stored_epoch = int(row["authority_epoch"])
             last_seq = int(row["last_seq"])
@@ -266,15 +271,16 @@ def ingest_page(
         if row is None:
             conn.execute(
                 """INSERT INTO hosted_room_replicas
-                   (room_id, name, members_json, discussion_policy_json, authority_gateway_id,
+                   (room_id, name, members_json, discussion_policy_json, lineage_version, authority_gateway_id,
                     authority_epoch, last_seq, latest_seq, event_bytes,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     room_id,
                     room_name,
                     members_json,
                     policy_json,
+                    lineage_version,
                     authority["gateway_id"],
                     authority["epoch"],
                     new_last,
@@ -321,7 +327,7 @@ def replica_state(db_path: Path | str, *, room_id: Any) -> dict[str, Any]:
     with _replica_transaction(db_path) as conn:
         _initialize_replica_schema(conn)
         row = conn.execute(
-            """SELECT room_id, name, members_json, discussion_policy_json, authority_gateway_id,
+            """SELECT room_id, name, members_json, discussion_policy_json, lineage_version, authority_gateway_id,
                       authority_epoch, last_seq, latest_seq, event_bytes,
                       created_at, updated_at
                  FROM hosted_room_replicas WHERE room_id=?""",
@@ -334,6 +340,7 @@ def replica_state(db_path: Path | str, *, room_id: Any) -> dict[str, Any]:
         "name": row["name"],
         "members": json.loads(row["members_json"]),
         "discussion_policy": json.loads(row["discussion_policy_json"]),
+        "lineage_version": int(row["lineage_version"]),
         "authority": {
             "gateway_id": row["authority_gateway_id"],
             "epoch": int(row["authority_epoch"]),
@@ -375,7 +382,7 @@ def promote_replica(
     with _replica_transaction(db_path) as conn:
         _initialize_replica_schema(conn)
         replica = conn.execute(
-            """SELECT room_id, name, members_json, discussion_policy_json, authority_gateway_id,
+            """SELECT room_id, name, members_json, discussion_policy_json, lineage_version, authority_gateway_id,
                       authority_epoch, last_seq, event_bytes
                  FROM hosted_room_replicas WHERE room_id=?""",
             (room_id,),
@@ -427,15 +434,16 @@ def promote_replica(
 
         conn.execute(
             """INSERT INTO hosted_rooms
-               (room_id, name, members_json, discussion_policy_json, authority_gateway_id,
+               (room_id, name, members_json, discussion_policy_json, lineage_version, authority_gateway_id,
                 authority_epoch, next_seq, event_bytes, revision,
                 created_at, updated_at, disbanded_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL)""",
             (
                 room_id,
                 replica["name"],
                 replica["members_json"],
                 replica["discussion_policy_json"],
+                replica["lineage_version"],
                 local_gateway,
                 target_epoch,
                 claim_seq + 1,

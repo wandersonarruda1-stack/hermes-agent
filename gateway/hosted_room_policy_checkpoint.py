@@ -315,7 +315,33 @@ class HostedRoomPolicyCheckpoint:
                ORDER BY events.seq""",
             (room_id, thread_id, room_id, thread_id, room_id, room_id),
         ).fetchall()
-        return [self._event_from_room_row(row) for row in rows]
+        events = [self._event_from_room_row(row) for row in rows]
+        by_id = {event["event_id"]: event for event in events}
+        pending = list(events)
+        # The visible transcript is bounded, but a retained v1 member message
+        # still needs its sealed parent/root for replay. Follow only member
+        # edges (depth <= 4), never the unbounded chain of user reopen links.
+        while pending:
+            event = pending.pop()
+            payload = event["payload"]
+            if event["kind"] != "message.member" or "lineage_digest" not in payload:
+                continue
+            for reference in (payload.get("root_event_id"), payload.get("re")):
+                if not isinstance(reference, str) or reference in by_id:
+                    continue
+                row = conn.execute(
+                    "SELECT * FROM hosted_room_events WHERE room_id=? AND event_id=?",
+                    (room_id, reference),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("lineage ancestor missing from durable history")
+                ancestor = self._event_from_room_row(row)
+                if (ancestor["seq"] >= event["seq"]
+                        or ancestor["payload"].get("thread_id") != thread_id):
+                    raise RuntimeError("invalid lineage ancestor")
+                by_id[reference] = ancestor
+                pending.append(ancestor)
+        return sorted(by_id.values(), key=lambda event: event["seq"])
 
     def _apply_event(self, conn: sqlite3.Connection, event: Mapping[str, Any]) -> None:
         room_id = str(event["room_id"])

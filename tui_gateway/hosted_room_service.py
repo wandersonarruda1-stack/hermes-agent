@@ -583,7 +583,7 @@ class HostedRoomService:
         return hosted_rooms.append_event(
             self.db_path,
             room_id=str(room["room_id"]),
-            event_id=f"dactivity:{decision.discussion_event_id}:{decision.reason}",
+            event_id=decision.receipt_event_id or f"dactivity:{decision.discussion_event_id}:{decision.reason}",
             kind="room.activity",
             actor={"kind": "gateway", "id": str(room["authority_gateway_id"])},
             payload={
@@ -591,6 +591,7 @@ class HostedRoomService:
                 "reason_code": decision.reason,
                 "thread_id": decision.thread_id,
                 "discussion_event_id": decision.discussion_event_id,
+                **(dict(decision.receipt) if decision.receipt else {}),
             },
             authority_gateway_id=str(room["authority_gateway_id"]),
             authority_epoch=int(room["authority_epoch"]),
@@ -672,8 +673,11 @@ class HostedRoomService:
         return discussion.DiscussionPolicy.from_dict(config.hosted_rooms["discussion"])
 
     def create_room(
-        self, *, room_id: str, name: str, members: Any, discussion_policy: Any = None
+        self, *, room_id: str, name: str, members: Any, discussion_policy: Any = None,
+        lineage_version: int = 0, principal: str | None = None
     ) -> dict[str, Any]:
+        if lineage_version and not principal:
+            raise ValueError("authenticated RPC principal required")
         policy = self.discussion_policy().reduce(discussion_policy)
         normalized = discussion.validate_roster(
             members,
@@ -685,6 +689,7 @@ class HostedRoomService:
             room_id=room_id,
             name=name,
             discussion_policy=policy,
+            lineage_version=lineage_version,
             members=[
                 {
                     "member_id": member.member_id,
@@ -704,21 +709,48 @@ class HostedRoomService:
         self.runtime.wakeup()
         return room
 
-    def send(
+    def send(self, *, room_id: str, event_id: str, payload: Any,
+             principal: str | None = None) -> dict[str, Any]:
+        # Admission and founder checks must serialize with planning/replay.
+        with self._policy_lock:
+            return self._send_locked(room_id=room_id, event_id=event_id,
+                                     payload=payload, principal=principal)
+
+    def _send_locked(
         self,
         *,
         room_id: str,
         event_id: str,
         payload: Any,
+        principal: str | None = None,
     ) -> dict[str, Any]:
-        normalized = discussion.validate_user_payload(payload)
+        from gateway import hosted_room_lineage as lineage
         room = self._owned_room(room_id)
+        actor = {"kind": "user", "id": "desktop"}
+        if room.get("lineage_version"):
+            events = []
+            cursor = 0
+            while True:
+                page = hosted_rooms.read_events(self.db_path, room_id=room_id,
+                    since_seq=cursor, limit=hosted_rooms.MAX_LOG_LIMIT)["events"]
+                events.extend(page)
+                if not page:
+                    break
+                cursor = page[-1]["seq"]
+            # Retries must validate against the history at original admission.
+            existing = next((e for e in events if e["event_id"] == event_id), None)
+            if existing:
+                events = [e for e in events if e["seq"] < existing["seq"]]
+            payload = lineage.user_payload(payload, event_id=event_id,
+                                           principal=principal, events=events)
+            actor = {"kind": "user", "id": principal}
+        normalized = discussion.validate_user_payload(payload)
         event = hosted_rooms.append_event(
             self.db_path,
             room_id=room_id,
             event_id=event_id,
             kind="message.user",
-            actor={"kind": "user", "id": "desktop"},
+            actor=actor,
             payload=normalized,
             authority_gateway_id=str(room["authority_gateway_id"]),
             authority_epoch=int(room["authority_epoch"]),
