@@ -1,0 +1,4 @@
+name: service
+version: 1.0.0
+description: "Hosted-room service authentication using separate 0600 profile token files; no interactive login."
+kind: backend

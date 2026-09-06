@@ -519,6 +519,10 @@ def _lineage_principal():
     from .transport import current_transport
     from .methods_browser_control import _is_authenticated_identity, _principal_digest
     identity = getattr(current_transport(), "auth_identity", None)
+    if isinstance(identity, dict) and identity.get("provider") == "service":
+        from hermes_cli.dashboard_auth.service import service_profile
+        profile = service_profile(identity)
+        return f"service:{profile}" if profile else None
     return _principal_digest(identity) if _is_authenticated_identity(identity) else None
 
 

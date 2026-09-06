@@ -120,6 +120,11 @@ def authenticate_token(
         return None, None
     unreachable: Optional[str] = None
     for provider in list_token_providers():
+        # Providers may limit credentials to exact routes without changing
+        # the existing unscoped provider contract (e.g. drain control).
+        paths = getattr(provider, "token_paths", None)
+        if paths is not None and request.url.path not in paths:
+            continue
         try:
             principal = provider.verify_token(token=token)
         except ProviderError as e:

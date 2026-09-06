@@ -684,6 +684,13 @@ class HostedRoomService:
             policy=policy,
             local_profiles=self.local_profiles(),
         )
+        if principal and principal.startswith("service:"):
+            profile = principal.removeprefix("service:")
+            if lineage_version != 1 or not any(
+                member.profile == profile and (member.target or {}).get("kind") == "local"
+                for member in normalized
+            ):
+                raise ValueError("service founder must be a local member of a lineage-v1 room")
         room = hosted_rooms.create_room(
             self.db_path,
             room_id=room_id,
@@ -727,6 +734,14 @@ class HostedRoomService:
         from gateway import hosted_room_lineage as lineage
         room = self._owned_room(room_id)
         actor = {"kind": "user", "id": "desktop"}
+        if principal and principal.startswith("service:"):
+            profile = principal.removeprefix("service:")
+            if room.get("lineage_version") != 1 or not any(
+                member.get("profile") == profile
+                and member.get("target", {}).get("kind", "local") == "local"
+                for member in room["members"]
+            ):
+                raise ValueError("service caller must be a local member of a lineage-v1 room")
         if room.get("lineage_version"):
             events = []
             cursor = 0

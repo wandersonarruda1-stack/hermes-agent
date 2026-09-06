@@ -3251,6 +3251,11 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             return normalized
 
         _rid, method, _params = normalized
+        identity = getattr(t, "auth_identity", None)
+        if isinstance(identity, dict) and identity.get("provider") == "service":
+            from hermes_cli.dashboard_auth.service import SERVICE_METHODS, service_profile
+            if not service_profile(identity) or method not in SERVICE_METHODS:
+                return _err(_rid, 4403, "service credential cannot call this method")
         if method not in _LONG_HANDLERS:
             return handle_request(req)
 
