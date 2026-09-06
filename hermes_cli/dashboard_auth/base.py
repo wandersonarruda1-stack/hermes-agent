@@ -224,6 +224,10 @@ class DashboardAuthProvider(ABC):
     # future machine-credential provider drops in without core changes.
     supports_token: bool = False
 
+    # Optional exact HTTP path restriction for this provider's credentials.
+    # None preserves the existing contract on all registered token routes.
+    token_paths: Optional[tuple[str, ...]] = None
+
     # When True, this provider does the interactive cookie-session flow (login,
     # verify, refresh). The login page, /auth/login, and the gate's
     # verify/refresh loops consult only supports_session providers, so a

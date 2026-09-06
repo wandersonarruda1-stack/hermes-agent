@@ -16696,6 +16696,9 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
 
         try:
             info = consume_ticket(ticket)
+            # A service credential must never become a PTY/console/event credential.
+            if info.get("provider") == "service" and ws.url.path != "/api/ws":
+                return "service_endpoint_forbidden", "ticket"
             # The ticket binds a server-minted {user_id, provider}; stamp it
             # onto the WS object so ``gateway_ws`` can hand it to the gateway
             # transport, where it is the sole identity authority for

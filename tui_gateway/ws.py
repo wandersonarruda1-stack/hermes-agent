@@ -437,7 +437,7 @@ async def handle_ws(
                 },
             }
         )
-        if ready_ok:
+        if ready_ok and (auth_identity or {}).get("provider") != "service":
             # Live-apply skins Hermes activates mid-conversation.
             server._ensure_skin_watcher()
             # Track this peer for session-less global broadcasts (skin.changed

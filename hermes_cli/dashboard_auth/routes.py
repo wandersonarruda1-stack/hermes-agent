@@ -48,10 +48,30 @@ from hermes_cli.dashboard_auth.cookies import (
     set_session_cookies,
 )
 from hermes_cli.dashboard_auth.login_page import render_login_html
+from hermes_cli.dashboard_auth.service import SCOPE, TICKET_ROUTE, service_profile
+from hermes_cli.dashboard_auth.token_auth import register_token_route
 
 _log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+register_token_route(TICKET_ROUTE)
+
+
+@router.post(TICKET_ROUTE, name="auth_service_ws_ticket")
+async def api_auth_service_ws_ticket(request: Request):
+    principal = getattr(request.state, "token_principal", None)
+    identity = {"provider": getattr(principal, "provider", None),
+                "user_id": getattr(principal, "principal", None)}
+    if not service_profile(identity) or SCOPE not in getattr(principal, "scopes", ()):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not getattr(request.app.state, "auth_required", False):
+        raise HTTPException(status_code=409, detail="Service tickets require gated authentication")
+    from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
+    ticket = mint_ticket(**identity)
+    audit_log(AuditEvent.WS_TICKET_MINTED, provider="service",
+              user_id=identity["user_id"], ip=_client_ip(request))
+    return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}
 
 
 def _redirect_uri(request: Request) -> str:
